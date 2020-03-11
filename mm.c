@@ -1,5 +1,5 @@
 /* 
- * Simple allocator based on implicit free lists, first fit search,
+ * Simple allocator based on explicit free lists, first fit search,
  * and boundary tag coalescing. 
  *
  * Each block has header and footer of the form:
@@ -10,18 +10,38 @@
  *      ----------------------------------- 
  * 
  * where s are the meaningful size bits and a/f is 1 
- * if and only if the block is allocated. The list has the following form:
+ * if and only if the block is allocated. The heap has the following form:
  *
  * begin                                                             end
  * heap                                                             heap  
- *  -----------------------------------------------------------------   
- * |  pad   | hdr(16:a) | ftr(16:a) | zero or more usr blks | hdr(0:a) |
- *  -----------------------------------------------------------------
+ *  ---------------------------------------------------------------------  
+ * |  HEAD   | hdr(16:a) | ftr(16:a) | zero or more usr blks | hdr(0:a) |
+ *  --------------------------------------------------------------------
  *          |       prologue        |                       | epilogue |
  *          |         block         |                       | block    |
  *
  * The allocated prologue and epilogue blocks are overhead that
  * eliminate edge conditions during coalescing.
+ * 
+ * The explicit free list is structured such that the head of the free list 
+ * is stored before the prologue block. It stores a pointer to the first
+ * free block.
+ * 
+ * Each allocated block contains a header, a footer, and at least two words of
+ * payload for the user.
+ * 
+ * Each free block contains a header, footer, a pointer to the next free block
+ * in list order, and a pointer to the previous free block in list order. The 
+ * pointer to the next free block is stored immediately after the header, and
+ * the pointer to the previous free block immediately thereafter. When adding
+ * a block to the list, we make the head point to it after updating its next
+ * field to match the previous head value. The final free block, or the head if
+ * the list is empty, has NULL as the value for its pointer to the next block.
+ * 
+ * The allocator goes to the block pointed to by HEAD, and proceeds along the 
+ * list, checking each block for size, then if that block isn't large enough, 
+ * going to the next block. When it comes to NULL, it returns NULL to malloc, 
+ * causing malloc to request more space.
  */
 
 #include <stdio.h>
@@ -85,6 +105,18 @@ team_t team = {
 #define NEXT_BLKP(bp)  (PADD(bp, GET_SIZE(HDRP(bp))))
 #define PREV_BLKP(bp)  (PSUB(bp, GET_SIZE((PSUB(bp, DSIZE)))))
 
+/* Returns (pointer to) pointer to the head node of explicit free list  */
+#define HEAD         (* (void**)PSUB(heap_start, DSIZE))
+#define HEAD_PTR     ((void*) PSUB(heap_start, DSIZE))
+
+/* Given free block ptr bp, compute next free block and previous free block in list */
+#define NEXT_FREE_BLKP(bp)  (* (void**) bp)
+#define PREV_FREE_BLKP(bp)  (* (void**) PADD(bp, WSIZE))
+
+/* Given free block ptr bp, compute position of pointers to next and previous free block*/
+#define NEXT_FREE_BLKP_POS(bp) ((void*) bp)
+#define PREV_FREE_BLKP_POS(bp) ((void*) PADD(bp, WSIZE))
+
 /* Global variables */
 
 // Pointer to first block
@@ -123,9 +155,69 @@ int mm_init(void) {
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
-    
+
     return 0;
 }
+
+static void print_free_list() {
+    char *bp;
+    char *bp_prev = NULL;
+
+    printf("Free List (%p):\n", HEAD);
+    if (HEAD == NULL) {
+        return;
+    }
+    for (bp = HEAD; NEXT_FREE_BLKP(bp) != NULL; bp = NEXT_FREE_BLKP(bp)) {
+        if (bp == bp_prev) {
+            printf("Something blew up at [%p], after [%p] \n", bp, bp_prev);
+            exit(0);
+        }
+        bp_prev = bp;
+        print_block(bp);
+    }
+    print_block(bp);
+}
+
+/* 
+ * add_to_list -- Adds a free block into the explicit free list
+ * Takes a pointer to a coalesced block and adds it to the explicit free list
+ * Returns nothing
+ * The input block must be a free block
+ */
+static void add_to_list(void *bp) {
+    if (HEAD != NULL) {
+        PUT(PREV_FREE_BLKP_POS(HEAD), (size_t) bp);
+    }
+    PUT(NEXT_FREE_BLKP_POS(bp), (size_t) HEAD);
+    PUT(PREV_FREE_BLKP_POS(bp), (size_t) NULL);
+    PUT(HEAD_PTR, (size_t) bp);
+}
+
+/* 
+ * remove_from_list -- Removes a free block into the explicit free list
+ * Takes a pointer to a free block and removes it from the explicit free list
+ * Returns nothing
+ * The input block must be a free block
+ */
+static void remove_from_list(void *bp) {
+    // If the block is head
+    if (bp == HEAD && NEXT_FREE_BLKP_POS(bp) != NULL) {
+        PUT(HEAD_PTR, (size_t) NEXT_FREE_BLKP(bp));
+    } 
+    else if (bp == HEAD && NEXT_FREE_BLKP_POS(bp) == NULL) {
+        PUT(bp, 0);
+    
+    } 
+    // Block is not the head
+    else {
+        if (NEXT_FREE_BLKP(bp) != NULL) {
+            PUT(PREV_FREE_BLKP_POS(NEXT_FREE_BLKP(bp)), (size_t)PREV_FREE_BLKP(bp));
+        }
+        PUT(NEXT_FREE_BLKP_POS(PREV_FREE_BLKP(bp)), (size_t) NEXT_FREE_BLKP(bp));
+
+    }
+}
+
 
 /* 
  * mm_malloc -- <What does this function do?>
@@ -172,10 +264,6 @@ void *mm_malloc(size_t size) {
  * <Are there any preconditions or postconditions?>
  */
 void mm_free(void *bp) {
-    /* PUT(FTRP(bp), PACK(GET_SIZE(HDRP(bp)), 0));
-     * PUT(HDRP(bp), PACK(GET_SIZE(HDRP(bp)), 0));
-     * mm_coalesce(bp);
-     */
     /* Set the footer value to the size packed with 0
      * Set the header value to the size packed with 0
      * Coalesce the block
@@ -209,29 +297,26 @@ void *mm_realloc(void *ptr, size_t size) {
  * <Are there any preconditions or postconditions?>
  */
 static void place(void *bp, size_t asize) {
-    // TODO: improve this function
 
-    // REPLACE THIS
-    // currently does no splitting, just allocates the entire free block
     /* Go to footer of bp. Subtract asize from it.
      * Jump backwards by that amount - 8, put the footer value there.
      * Jump backwards 8 bytes and put asize | 1 there.
      * Go to the header of bp and put asize | 1 there.
      */
-    // we shouldn't split if nextsize is smaller than 16
+    // we shouldn't split if nextsize is smaller than 32
     size_t nextsize = GET_SIZE(HDRP(bp)) - asize;
-    // If the remaining free block to be split is less than 16, don't split
-    if (nextsize < DSIZE) {
+    // If the remaining free block to be split is less than 32, don't split
+    remove_from_list(bp);
+    if (nextsize < DSIZE + OVERHEAD) {
         PUT(HDRP(bp), PACK(GET_SIZE(HDRP(bp)), 1));
         PUT(FTRP(bp), PACK(GET_SIZE(HDRP(bp)), 1));
     } else {
         PUT(FTRP(bp), nextsize); // Update footer of free to have updated size after splitting
         PUT(PADD(bp, asize - WSIZE), nextsize); // Updating header of free block after splitting
+        add_to_list(PADD(bp, asize));
         PUT(HDRP(bp), PACK(asize, 1)); // Update header of bp
         PUT(FTRP(bp), PACK(asize, 1)); // Update footer of bp
     }
-
-    
 }
 
 /*
@@ -241,7 +326,6 @@ static void place(void *bp, size_t asize) {
  * <Are there any preconditions or postconditions?>
  */
 static void *coalesce(void *bp) {
-    // TODO: improve this function
     /*
      * Go to footer of previous block
      * If free, set the header size to that size + coalesced block size
@@ -250,31 +334,31 @@ static void *coalesce(void *bp) {
      * Go to the footer of the block to be coalesced and update the size 
      */
     void* coalesced_block = bp;
+    int was_on_list = 0;
     if (!GET_ALLOC(HDRP(PREV_BLKP(bp)))) {
         PUT(HDRP(PREV_BLKP(bp)), GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(bp)));
         coalesced_block = PREV_BLKP(bp);
+        was_on_list = 1;
     }
     if (!GET_ALLOC(HDRP(NEXT_BLKP(coalesced_block)))) {
+        remove_from_list(NEXT_BLKP(coalesced_block));
         PUT(HDRP(coalesced_block), GET_SIZE(HDRP(NEXT_BLKP(coalesced_block))) + GET_SIZE(HDRP(coalesced_block)));
     }
     PUT(FTRP(coalesced_block), GET(HDRP(coalesced_block)));
-    // if(!check_heap(257)) {
-    //     printf("FOUND A PROBLEM. TERMINATING PROGRAM\n");
-    //     exit(EXIT_FAILURE);
-    // }
-    // print_heap();
+    if (!was_on_list) {
+        add_to_list(coalesced_block);
+    }
     return coalesced_block;
 }
-
 
 /* 
  * find_fit - Find a fit for a block with asize bytes 
  */
 static void *find_fit(size_t asize) {
     /* search from the start of the free list to the end */
-    for (char *cur_block = heap_start; GET_SIZE(HDRP(cur_block)) > 0; cur_block = NEXT_BLKP(cur_block)) {
-        if (!GET_ALLOC(HDRP(cur_block)) && (asize <= GET_SIZE(HDRP(cur_block))))
-            return cur_block;
+    for (char* bp = HEAD; bp != NULL; bp = NEXT_FREE_BLKP(bp)) {
+        if (asize <= GET_SIZE(HDRP(bp)))
+            return bp;
     }
 
     return NULL;  /* no fit found */
@@ -291,7 +375,6 @@ static void *extend_heap(size_t words) {
     size = words * WSIZE;
     if (words % 2 == 1)
         size += WSIZE;
-    // printf("extending heap to %zu bytes\n", mem_heapsize());
     if ((long)(bp = mem_sbrk(size)) < 0) 
         return NULL;
 
@@ -354,6 +437,7 @@ static void print_heap() {
     char *bp;
 
     printf("Heap (%p):\n", heap_start);
+    printf("Free list head at (%p)\n", HEAD);
 
     for (bp = heap_start; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         print_block(bp);
@@ -378,9 +462,10 @@ static void print_block(void *bp) {
         return;
     }
 
-    printf("%p: header: [%ld:%c] footer: [%ld:%c]\n", bp, 
+    printf("%p: header: [%ld:%c] footer: [%ld:%c] next: [%p] prev: [%p]\n", bp, 
        hsize, (halloc ? 'a' : 'f'), 
-       fsize, (falloc ? 'a' : 'f')); 
+       fsize, (falloc ? 'a' : 'f'), 
+       NEXT_FREE_BLKP(bp), PREV_FREE_BLKP(bp)); 
 }
 
 /*

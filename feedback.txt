@@ -1,0 +1,7 @@
+How many hours you spent outside of class on this homework: 10
+
+The difficulty of this homework: too easy, easy, moderate, challenging, or too hard: challenging
+
+What you learned on this homework (very briefly): How a memory allocator works and how small changes can lead to large differences in throughput and efficiency.
+
+Rate the educational value relative to the time invested from 1 (low) to 5 (high): 4
